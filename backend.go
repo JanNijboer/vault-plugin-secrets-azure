@@ -240,6 +240,7 @@ func (b *azureSecretBackend) getClient(ctx context.Context, s logical.Storage) (
 		provider:   p,
 		settings:   b.settings,
 		expiration: time.Now().Add(clientLifetime),
+		logger:     b.Logger(),
 	}
 	b.client = c
 

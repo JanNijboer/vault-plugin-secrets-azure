@@ -6,12 +6,18 @@ package azuresecrets
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault-plugin-secrets-azure/api"
+	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/microsoftgraph/msgraph-sdk-go/models/odataerrors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRetry(t *testing.T) {
@@ -104,47 +110,182 @@ func TestRetry(t *testing.T) {
 	})
 }
 
-// TestSPCreate_RetryLogic ensures createSP invokes retry logic when provider.CreateServicePrincipal
-// repeatedly returns transient Azure-style errors before eventually succeeding.
-func TestSPCreate_RetryLogic(t *testing.T) {
-	t.Parallel()
+type failingSPProvider struct {
+	AzureProvider
+	err       error
+	deleteErr error
+	calls     int
+}
 
-	// Use the mock backend so we can inject our modified mockProvider
-	b, s := getTestBackendMocked(t, true)
+func (p *failingSPProvider) CreateServicePrincipal(context.Context, string, time.Time, time.Time) (string, string, error) {
+	p.calls++
+	return "", "", p.err
+}
 
-	// Create a mock provider with deterministic SP failures
-	mp := newMockProvider().(*mockProvider)
-	mp.failNextCreateServicePrincipal = true // enable the failure mode
-	mp.servicePrincipalFailureCount = 3      // fail first 3 calls
-	mp.servicePrincipalCalls = 0             // track total calls
-
-	// Patch the backend to return our custom mock provider
-	b.getProvider = func(ctx context.Context, lg hclog.Logger, sys logical.SystemView, cs *clientSettings) (AzureProvider, error) {
-		return mp, nil
+func (p *failingSPProvider) DeleteApplication(ctx context.Context, id string, permanentlyDelete bool) error {
+	if p.deleteErr != nil {
+		return p.deleteErr
 	}
+	return p.AzureProvider.DeleteApplication(ctx, id, permanentlyDelete)
+}
 
-	// Create a fake role so the backend will try to issue creds
-	roleName := generateUUID()
-	testRoleCreate(t, b, s, roleName, testRole)
+func TestSPCreateFailureRetainsWAL(t *testing.T) {
+	for _, failure := range []error{
+		errors.New("the backing application of the service principal being created must be in the local tenant"),
+		errors.New("does not exist or one of its queried reference-property objects are not present"),
+		errors.New("service principal name is already in use"),
+		errors.New("Authorization_RequestDenied"),
+		errors.New("add service principal password POST: uncertain outcome; delete failed"),
+		context.Canceled,
+	} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			b, s := getTestBackendMocked(t, true)
+			mp := newMockProvider().(*mockProvider)
+			p := &failingSPProvider{AzureProvider: mp, err: failure}
+			b.getProvider = func(context.Context, hclog.Logger, logical.SystemView, *clientSettings) (AzureProvider, error) {
+				return p, nil
+			}
+			testRoleCreate(t, b, s, "test", testRole)
+			resp, err := b.HandleRequest(context.Background(), &logical.Request{
+				Operation: logical.ReadOperation, Path: "creds/test", Storage: s,
+			})
+			require.ErrorIs(t, err, failure)
+			require.Nil(t, resp)
+			require.Equal(t, 1, p.calls, "must not retry the combined provider operation")
 
-	// Requesting credentials triggers: CreateApplication -> CreateServicePrincipal
-	resp, err := b.HandleRequest(context.Background(), &logical.Request{
-		Operation: logical.ReadOperation,
-		Path:      "creds/" + roleName,
-		Storage:   s,
-	})
-
-	// The retry logic should hide the transient failures
-	if err != nil {
-		t.Fatalf("Expected retry logic to recover but got error: %v", err)
+			ctx := context.Background()
+			entries, err := framework.ListWAL(ctx, s)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			entry, err := framework.GetWAL(ctx, s, entries[0])
+			require.NoError(t, err)
+			require.Equal(t, walAppKey, entry.Kind)
+			appID := entry.Data.(map[string]interface{})["AppObjID"].(string)
+			require.Contains(t, mp.applications, appID)
+			p.deleteErr = errors.New("application delete failed")
+			require.ErrorIs(t, b.walRollback(ctx, &logical.Request{Storage: s}, entry.Kind, entry.Data), p.deleteErr)
+			retained, err := framework.GetWAL(ctx, s, entries[0])
+			require.NoError(t, err)
+			require.NotNil(t, retained)
+			require.Contains(t, mp.applications, appID)
+			p.deleteErr = nil
+			require.NoError(t, b.walRollback(ctx, &logical.Request{Storage: s}, entry.Kind, entry.Data))
+			require.NotContains(t, mp.applications, appID)
+			require.NotContains(t, mp.deletedObjects, appID, "rollback permanently deletes the app")
+			require.NoError(t, framework.DeleteWAL(ctx, s, entries[0]))
+			entries, err = framework.ListWAL(ctx, s)
+			require.NoError(t, err)
+			require.Empty(t, entries)
+		})
 	}
-	if resp.IsError() {
-		t.Fatalf("Unexpected Vault response error: %#v", resp.Error())
-	}
+}
 
-	// Validate retry behavior: 3 failures + 1 success = 4 calls
-	if mp.servicePrincipalCalls != 4 {
-		t.Fatalf("Expected 4 calls (3 failures + 1 success), got %d", mp.servicePrincipalCalls)
+func TestSPCreateCanceledBeforeProvider(t *testing.T) {
+	p := &failingSPProvider{err: errors.New("must not be called")}
+	c := &client{provider: p}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _, err := c.createSP(ctx, api.Application{AppID: "app"}, time.Hour)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, p.calls)
+}
+
+type groupMembershipProvider struct {
+	AzureProvider
+	failGroup string
+	err       error
+	groups    []string
+	members   []string
+	check     func(context.Context)
+	results   []error
+}
+
+func (p *groupMembershipProvider) AddGroupMember(ctx context.Context, groupID, memberID string) error {
+	p.groups = append(p.groups, groupID)
+	p.members = append(p.members, memberID)
+	if p.check != nil {
+		p.check(ctx)
+	}
+	if len(p.groups) <= len(p.results) {
+		return p.results[len(p.groups)-1]
+	}
+	if groupID == p.failGroup {
+		return p.err
+	}
+	return nil
+}
+
+func TestGroupMembershipErrorContext(t *testing.T) {
+	for _, failGroup := range []string{"first-group", "second-group"} {
+		for _, withMetadata := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/metadata=%t", failGroup, withMetadata), func(t *testing.T) {
+				graphErr := odataerrors.NewODataError()
+				detail := odataerrors.NewMainError()
+				message := "Membership modification denied."
+				detail.SetMessage(&message)
+				graphErr.SetErrorEscaped(detail)
+				graphErr.SetStatusCode(403)
+				if withMetadata {
+					code := "Authorization_RequestDenied"
+					detail.SetCode(&code)
+					graphErr.GetResponseHeaders().Add("Request-Id", "graph-correlation-id")
+					graphErr.GetResponseHeaders().Add("Other-Header", "must-not-be-disclosed")
+				} else {
+					graphErr.SetResponseHeaders(nil)
+				}
+				p := &groupMembershipProvider{
+					failGroup: failGroup,
+					err:       fmt.Errorf("provider: %w", graphErr),
+				}
+				c := &client{provider: p}
+				err := c.addGroupMemberships(context.Background(), "new-sp", []*AzureGroup{
+					{GroupName: "First group", ObjectID: "first-group"},
+					{GroupName: "Second group", ObjectID: "second-group"},
+				})
+				require.ErrorIs(t, err, graphErr)
+				var got *odataerrors.ODataError
+				require.ErrorAs(t, err, &got)
+				require.Same(t, graphErr, got)
+				require.ErrorContains(t, err, fmt.Sprintf("group_object_id=%q", failGroup))
+				require.ErrorContains(t, err, `sp_object_id="new-sp"`)
+				require.ErrorContains(t, err, "graph_status=403")
+				require.ErrorContains(t, err, message)
+				require.NotContains(t, err.Error(), "must-not-be-disclosed")
+				if withMetadata {
+					require.ErrorContains(t, err, `graph_code="Authorization_RequestDenied"`)
+					require.ErrorContains(t, err, `graph_request_id="graph-correlation-id"`)
+				} else {
+					require.ErrorContains(t, err, `graph_code=""`)
+					require.ErrorContains(t, err, `graph_request_id=""`)
+				}
+				if failGroup == "first-group" {
+					require.ErrorContains(t, err, `group_name="First group"`)
+					require.Equal(t, []string{"first-group"}, p.groups)
+					require.Equal(t, []string{"new-sp"}, p.members)
+				} else {
+					require.ErrorContains(t, err, `group_name="Second group"`)
+					require.Equal(t, []string{"first-group", "second-group"}, p.groups)
+					require.Equal(t, []string{"new-sp", "new-sp"}, p.members)
+				}
+			})
+		}
+	}
+}
+
+func TestGroupMembershipNonGraphError(t *testing.T) {
+	for _, failure := range []error{io.ErrUnexpectedEOF, context.Canceled, nil} {
+		p := &groupMembershipProvider{failGroup: "group", err: failure}
+		c := &client{provider: p}
+		err := c.addGroupMemberships(context.Background(), "sp", []*AzureGroup{{ObjectID: "group"}})
+		require.Equal(t, []string{"group"}, p.groups)
+		if failure == nil {
+			require.NoError(t, err)
+		} else {
+			require.ErrorIs(t, err, failure)
+			require.ErrorContains(t, err, `group_object_id="group"`)
+			require.ErrorContains(t, err, `sp_object_id="sp"`)
+			require.NotContains(t, err.Error(), "graph_status")
+		}
 	}
 }
 

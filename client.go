@@ -17,17 +17,20 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/vault/sdk/helper/pluginidentityutil"
 	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/microsoftgraph/msgraph-sdk-go/models/odataerrors"
 
 	"github.com/hashicorp/vault-plugin-secrets-azure/api"
 )
 
 const (
-	appNamePrefix  = "vault-"
-	retryTimeout   = 80 * time.Second
-	clientLifetime = 30 * time.Minute
+	appNamePrefix              = "vault-"
+	retryTimeout               = 80 * time.Second
+	clientLifetime             = 30 * time.Minute
+	groupMembershipDenialLimit = 5
 
 	azurePublicCloudBaseURI = "https://graph.microsoft.com"
 	azureChinaCloudBaseURI  = "https://microsoftgraph.chinacloudapi.cn"
@@ -35,8 +38,6 @@ const (
 	azurePublicCloudEnvName = "AZUREPUBLICCLOUD"
 	azureChinaCloudEnvName  = "AZURECHINACLOUD"
 	azureUSGovCloudEnvName  = "AZUREUSGOVERNMENTCLOUD"
-
-	errInvalidApplicationObject = "does not reference a valid application object"
 )
 
 // client offers higher level Azure operations that provide a simpler interface
@@ -46,6 +47,7 @@ type client struct {
 	provider   AzureProvider
 	settings   *clientSettings
 	expiration time.Time
+	logger     hclog.Logger
 }
 
 // Valid returns whether the client defined and not expired.
@@ -57,6 +59,7 @@ func (c *client) Valid() bool {
 // An Application is a needed to create service principals used by
 // the caller for authentication.
 func (c *client) createApp(ctx context.Context, signInAudience string, tags []string) (app api.Application, err error) {
+	api.SetIssuanceStage(ctx, "create_application")
 	// TODO: Make this name customizable with the same logic as username customization
 	name := uuid.New().String()
 
@@ -82,57 +85,24 @@ func (c *client) createSP(
 	app api.Application,
 	duration time.Duration) (spID string, password string, endDate time.Time, err error) {
 
-	type idPass struct {
-		ID       string
-		Password string
-		EndDate  time.Time
+	api.SetIssuanceStage(ctx, "create_service_principal")
+	if err := ctx.Err(); err != nil {
+		return "", "", time.Time{}, fmt.Errorf("error creating service principal: %w", err)
 	}
-
-	resultRaw, err := retry(ctx, func() (interface{}, bool, error) {
-		now := time.Now()
-		endDate := now.Add(duration)
-		spID, password, err := c.provider.CreateServicePrincipal(ctx, app.AppID, now, endDate)
-
-		// Propagation delays within Azure can cause transient errors when creating
-		// a service principal immediately after creating an application. Different
-		// tenants and APIs emit slightly different error messages, so match on a
-		// broader set of substrings rather than a single exact string.
-		if err != nil {
-			errStr := strings.ToLower(err.Error())
-			retryable :=
-				strings.Contains(errStr, "local tenant") ||
-					strings.Contains(errStr, errInvalidApplicationObject) ||
-					strings.Contains(errStr, "authorization_requestdenied") ||
-					strings.Contains(errStr, "propagation") ||
-					strings.Contains(errStr, "please try again") ||
-					strings.Contains(errStr, "could not find") ||
-					strings.Contains(errStr, "not found")
-
-			if retryable {
-				return nil, false, nil
-			}
-		}
-
-		result := idPass{
-			ID:       spID,
-			Password: password,
-			EndDate:  endDate,
-		}
-
-		return result, true, err
-	})
-
+	now := time.Now()
+	endDate = now.Add(duration)
+	// The provider retries individual Graph stages, never this combined operation.
+	spID, password, err = c.provider.CreateServicePrincipal(ctx, app.AppID, now, endDate)
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("error creating service principal: %w", err)
 	}
 
-	result := resultRaw.(idPass)
-
-	return result.ID, result.Password, result.EndDate, nil
+	return spID, password, endDate, nil
 }
 
 // addAppPassword adds a new password to an App's credentials list.
 func (c *client) addAppPassword(ctx context.Context, appObjID string, expiresIn time.Duration) (string, string, time.Time, error) {
+	api.SetIssuanceStage(ctx, "add_application_password")
 	exp := time.Now().Add(expiresIn)
 	resp, err := c.provider.AddApplicationPassword(ctx, appObjID, "vault-plugin-secrets-azure", exp)
 	if err != nil {
@@ -163,6 +133,11 @@ func (c *client) deleteApp(ctx context.Context, appObjectID string, permanentlyD
 	return c.provider.DeleteApplication(ctx, appObjectID, permanentlyDelete)
 }
 
+// purgeDeletedObject permanently deletes an already soft-deleted object.
+func (c *client) purgeDeletedObject(ctx context.Context, objectID string) error {
+	return c.provider.PurgeDeletedObject(ctx, objectID)
+}
+
 // deleteServicePrincipal deletes an Azure service principal.
 func (c *client) deleteServicePrincipal(ctx context.Context, spObjectID string, permanentlyDelete bool) error {
 	return c.provider.DeleteServicePrincipal(ctx, spObjectID, permanentlyDelete)
@@ -183,6 +158,7 @@ func (c *client) generateUUIDs(length int) ([]string, error) {
 
 // assignRoles assigns Azure roles to a service principal.
 func (c *client) assignRoles(ctx context.Context, spID string, roles []*AzureRole, assignmentIDs []string) ([]string, error) {
+	api.SetIssuanceStage(ctx, "assign_roles")
 	var ids []string
 
 	if len(roles) != len(assignmentIDs) {
@@ -190,10 +166,15 @@ func (c *client) assignRoles(ctx context.Context, spID string, roles []*AzureRol
 	}
 
 	for i, role := range roles {
+		attempt := 0
 		resultRaw, err := retry(ctx, func() (interface{}, bool, error) {
 			if assignmentIDs[i] == "" {
 				return nil, true, fmt.Errorf("assignmentID at index %d was empty", i)
 			}
+			if attempt > 0 {
+				api.RecordIssuanceRetry(ctx, "assign_roles")
+			}
+			attempt++
 			ra, err := c.provider.CreateRoleAssignment(ctx, role.Scope, assignmentIDs[i],
 				armauthorization.RoleAssignmentCreateParameters{
 					Properties: &armauthorization.RoleAssignmentProperties{
@@ -232,6 +213,9 @@ func (c *client) unassignRoles(ctx context.Context, roleIDs []string) error {
 	var merr *multierror.Error
 
 	for _, id := range roleIDs {
+		if err := ctx.Err(); err != nil {
+			return multierror.Append(merr, err).ErrorOrNil()
+		}
 		if _, err := c.provider.DeleteRoleAssignmentByID(ctx, id); err != nil {
 			// If a role was deleted out-of-band then Azure returns an error and status 204
 			respErr := new(azcore.ResponseError)
@@ -248,24 +232,116 @@ func (c *client) unassignRoles(ctx context.Context, roleIDs []string) error {
 
 // addGroupMemberships adds the service principal to the Azure groups.
 func (c *client) addGroupMemberships(ctx context.Context, spID string, groups []*AzureGroup) error {
+	api.SetIssuanceStage(ctx, "add_group_memberships")
 	for _, group := range groups {
-		_, err := retry(ctx, func() (interface{}, bool, error) {
-			err := c.provider.AddGroupMember(ctx, group.ObjectID, spID)
-
-			// Propagation delays within Azure can cause this error occasionally, so don't quit on it.
-			if err != nil && strings.Contains(err.Error(), "Request_ResourceNotFound") {
-				return nil, false, nil
-			}
-
-			return nil, true, err
-		})
-
-		if err != nil {
-			return fmt.Errorf("error while adding group membership: %w", err)
+		if err := c.addGroupMembership(ctx, spID, group); err != nil {
+			return fmt.Errorf("error while adding group membership (group_name=%q, group_object_id=%q, sp_object_id=%q%s): %w",
+				group.GroupName, group.ObjectID, spID, groupMembershipErrorDetails(err), err)
 		}
 	}
 
 	return nil
+}
+
+func (c *client) addGroupMembership(ctx context.Context, spID string, group *AzureGroup) error {
+	ctx, cancel := context.WithTimeout(ctx, retryTimeout)
+	defer cancel()
+
+	logger := c.logger
+	if logger == nil {
+		logger = hclog.Default()
+	}
+	logger = logger.With("group_name", group.GroupName, "group_object_id", group.ObjectID, "sp_object_id", spID)
+	var lastErr error
+	var retryReason string
+	denials := 0
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(err, lastErr)
+		}
+		if attempt > 1 {
+			api.RecordIssuanceRetry(ctx, retryReason)
+		}
+		err := c.provider.AddGroupMember(ctx, group.ObjectID, spID)
+		if err == nil {
+			if attempt > 1 {
+				logger.Info("group membership recovered after retry", "attempt", attempt, "authorization_denials", denials)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			err = errors.Join(ctx.Err(), err, lastErr)
+			logger.Warn("group membership cancelled", "attempt", attempt, "error", err, "graph", groupMembershipErrorDetails(err))
+			return err
+		}
+		lastErr = err
+
+		var delay time.Duration
+		switch {
+		case isGroupMembershipAuthorizationDenied(err):
+			retryReason = "group_authorization"
+			denials++
+			if denials >= groupMembershipDenialLimit {
+				logger.Warn("group membership authorization retries exhausted", "attempt", attempt, "error", err, "graph", groupMembershipErrorDetails(err))
+				return err
+			}
+			delay = 2 * time.Second << (denials - 1)
+			logger.Warn("retrying group membership authorization denial", "attempt", attempt, "retry_delay", delay, "error", err, "graph", groupMembershipErrorDetails(err))
+		case isGroupMembershipPropagationError(err):
+			retryReason = "group_propagation"
+			delay = time.Duration(2+rand.Intn(6)) * time.Second
+			logger.Debug("retrying group membership propagation error", "attempt", attempt, "retry_delay", delay, "error", err, "graph", groupMembershipErrorDetails(err))
+		default:
+			logger.Warn("group membership failed", "attempt", attempt, "error", err, "graph", groupMembershipErrorDetails(err))
+			return err
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			logger.Warn("group membership retry cancelled", "attempt", attempt, "error", ctx.Err(), "graph", groupMembershipErrorDetails(lastErr))
+			return errors.Join(ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func groupMembershipErrorDetails(err error) string {
+	return api.GraphErrorDetails(err)
+}
+
+func isGroupMembershipAuthorizationDenied(err error) bool {
+	var graphErr *odataerrors.ODataError
+	if !errors.As(err, &graphErr) || graphErr.GetStatusCode() != http.StatusForbidden {
+		return false
+	}
+	detail := graphErr.GetErrorEscaped()
+	return detail != nil && detail.GetCode() != nil && detail.GetMessage() != nil &&
+		strings.EqualFold(*detail.GetCode(), "Authorization_RequestDenied") &&
+		strings.EqualFold(strings.TrimSpace(*detail.GetMessage()), "Insufficient privileges to complete the operation.")
+}
+
+func isGroupMembershipPropagationError(err error) bool {
+	var graphErr *odataerrors.ODataError
+	if !errors.As(err, &graphErr) || graphErr.GetErrorEscaped() == nil {
+		return false
+	}
+	detail := graphErr.GetErrorEscaped()
+	if detail.GetCode() == nil {
+		return false
+	}
+	code := strings.ToLower(*detail.GetCode())
+	if graphErr.GetStatusCode() == http.StatusNotFound {
+		return code == "request_resourcenotfound"
+	}
+	if graphErr.GetStatusCode() != http.StatusBadRequest ||
+		(code != "request_badrequest" && code != "badrequest") || detail.GetMessage() == nil {
+		return false
+	}
+	message := strings.ToLower(*detail.GetMessage())
+	return strings.Contains(message, "does not exist or one of its queried reference-property objects are not present") ||
+		strings.Contains(message, "the source resource object or one of the objects being referenced don't exist")
 }
 
 // removeGroupMemberships removes the passed service principal from the passed
@@ -277,11 +353,6 @@ func (c *client) removeGroupMemberships(ctx context.Context, servicePrincipalObj
 
 	for _, id := range groupIDs {
 		if err := c.provider.RemoveGroupMember(ctx, id, servicePrincipalObjectID); err != nil {
-
-			// If a membership was deleted manually then Azure returns a error with a Status=404
-			if strings.Contains(err.Error(), "Status=404") {
-				continue
-			}
 			merr = multierror.Append(merr, fmt.Errorf("error removing group membership: %w", err))
 		}
 	}

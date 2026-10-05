@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/vault-plugin-secrets-azure/api"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/locksutil"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -68,13 +69,17 @@ func pathServicePrincipal(b *azureSecretBackend) *framework.Path {
 
 // pathSPRead generates Azure credentials based on the role credential type.
 func (b *azureSecretBackend) pathSPRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	roleName := d.Get("role").(string)
+	ctx, finish := api.StartIssuance(ctx, b.Logger().With("path", req.MountPoint+req.Path, "role", roleName, "request_id", req.ID))
+	success := false
+	defer func() { finish(success) }()
+
 	client, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
 
-	roleName := d.Get("role").(string)
-
+	api.SetIssuanceStage(ctx, "load_role")
 	role, err := getRole(ctx, roleName, req.Storage)
 	if err != nil {
 		return nil, err
@@ -85,6 +90,7 @@ func (b *azureSecretBackend) pathSPRead(ctx context.Context, req *logical.Reques
 	}
 
 	if role.ApplicationObjectID != "" {
+		api.SetIssuanceStage(ctx, "check_root_credential_target")
 		if err := b.checkRootCredentialTarget(client, role.ApplicationID, roleName, "read_dynamic_credentials"); err != nil {
 			return logical.ErrorResponse(err.Error()), nil
 		}
@@ -107,6 +113,7 @@ func (b *azureSecretBackend) pathSPRead(ctx context.Context, req *logical.Reques
 	if role.ExplicitMaxTTL != 0 && (role.ExplicitMaxTTL < role.MaxTTL || role.MaxTTL == 0) {
 		resp.Secret.MaxTTL = role.ExplicitMaxTTL
 	}
+	success = true
 	return resp, nil
 }
 
@@ -123,11 +130,14 @@ func (b *azureSecretBackend) createSPSecret(ctx context.Context, s logical.Stora
 	appObjID := app.AppObjectID
 
 	// Write a WAL entry in case the SP create process doesn't complete
-	walID, err := framework.PutWAL(ctx, s, walAppKey, &walApp{
+	api.SetIssuanceStage(ctx, "write_application_wal")
+	appWAL := &walApp{
 		AppID:      appID,
 		AppObjID:   appObjID,
+		IssuedAt:   time.Now(),
 		Expiration: time.Now().Add(maxWALAge),
-	})
+	}
+	walID, err := framework.PutWAL(ctx, s, walAppKey, appWAL)
 	if err != nil {
 		return nil, fmt.Errorf("error writing WAL: %w", err)
 	}
@@ -144,12 +154,27 @@ func (b *azureSecretBackend) createSPSecret(ctx context.Context, s logical.Stora
 		return nil, err
 	}
 
+	// Preserve the original until the replacement is durable. Older/ambiguous
+	// creates still use app-ID discovery during rollback.
+	api.SetIssuanceStage(ctx, "record_service_principal_wal")
+	appWAL.SPObjID = spID
+	replacementID, err := framework.PutWAL(ctx, s, walAppKey, appWAL)
+	if err != nil {
+		return nil, fmt.Errorf("error recording service principal in WAL: %w", err)
+	}
+	if err := framework.DeleteWAL(ctx, s, walID); err != nil {
+		return nil, fmt.Errorf("error replacing application WAL: %w", err)
+	}
+	walID = replacementID
+
+	api.SetIssuanceStage(ctx, "generate_role_assignment_ids")
 	assignmentIDs, err := c.generateUUIDs(len(role.AzureRoles))
 	if err != nil {
 		return nil, fmt.Errorf("error generating assignment IDs; err=%w", err)
 	}
 
 	// Write a second WAL entry in case the Role assignments don't complete
+	api.SetIssuanceStage(ctx, "write_role_assignment_wal")
 	rWALID, err := framework.PutWAL(ctx, s, walAppRoleAssignment, &walAppRoleAssign{
 		SpID:          spID,
 		AssignmentIDs: assignmentIDs,
@@ -172,10 +197,12 @@ func (b *azureSecretBackend) createSPSecret(ctx context.Context, s logical.Stora
 	}
 
 	// SP is fully created so delete the WALs
+	api.SetIssuanceStage(ctx, "delete_application_wal")
 	if err := framework.DeleteWAL(ctx, s, walID); err != nil {
 		return nil, fmt.Errorf("error deleting WAL: %w", err)
 	}
 
+	api.SetIssuanceStage(ctx, "delete_role_assignment_wal")
 	if err := framework.DeleteWAL(ctx, s, rWALID); err != nil {
 		return nil, fmt.Errorf("error deleting role assignment WAL: %w", err)
 	}
@@ -192,6 +219,7 @@ func (b *azureSecretBackend) createSPSecret(ctx context.Context, s logical.Stora
 		"role":                 roleName,
 		"permanently_delete":   role.PermanentlyDelete,
 		"key_end_date":         endDate.Format(time.RFC3339Nano),
+		"issued_at":            time.Now().Format(time.RFC3339Nano),
 	}
 
 	return b.Secret(SecretTypeSP).Response(data, internalData), nil
@@ -199,6 +227,7 @@ func (b *azureSecretBackend) createSPSecret(ctx context.Context, s logical.Stora
 
 // createStaticSPSecret adds a new password to the App associated with the role.
 func (b *azureSecretBackend) createStaticSPSecret(ctx context.Context, c *client, roleName string, role *roleEntry) (*logical.Response, error) {
+	api.SetIssuanceStage(ctx, "lock_application")
 	lock := locksutil.LockForKey(b.appLocks, role.ApplicationObjectID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -320,10 +349,25 @@ func (b *azureSecretBackend) spRevoke(ctx context.Context, req *logical.Request,
 		return nil, fmt.Errorf("error during revoke: %w", err)
 	}
 
-	// unassigning roles is effectively a garbage collection operation. Errors will be noted but won't fail the
-	// revocation process. Deleting the app, however, *is* required to consider the secret revoked.
-	if err := c.unassignRoles(ctx, raIDs); err != nil {
-		resp.AddWarning(err.Error())
+	issuedAt, err := leaseIssuedAt(req.Secret)
+	if err != nil {
+		return nil, err
+	}
+	cleanupCtx := b.reconciliationContext(ctx, issuedAt, appObjectID)
+	if err := b.deferPurge(ctx, req.Storage, c.deleteApp(cleanupCtx, appObjectID, permanentlyDelete)); err != nil {
+		return resp, err
+	}
+
+	// Failed housekeeping must be durable before the lease can be forgotten.
+	for _, id := range raIDs {
+		if err := c.unassignRoles(ctx, []string{id}); err != nil {
+			resp.AddWarning(err.Error())
+			if _, walErr := framework.PutWAL(ctx, req.Storage, walAppRoleAssignment, &walAppRoleAssign{
+				SpID: spObjectID, RoleAssignmentIDs: []string{id}, Expiration: time.Now().Add(maxWALAge),
+			}); walErr != nil {
+				return resp, errors.Join(err, fmt.Errorf("error recording role assignment cleanup: %w", walErr))
+			}
+		}
 	}
 
 	// removing group membership is effectively a garbage collection
@@ -333,15 +377,49 @@ func (b *azureSecretBackend) spRevoke(ctx context.Context, req *logical.Request,
 		resp.AddWarning(err.Error())
 	}
 
-	// removing the service principal is effectively a garbage collection
-	// operation. Errors will be noted but won't fail the revocation process.
-	// Deleting the app, however, *is* required to consider the secret revoked.
-	if err := c.deleteServicePrincipal(ctx, spObjectID, permanentlyDelete); err != nil {
-		resp.AddWarning(err.Error())
+	// App deletion cascades only a soft delete. Preserve failed SP cleanup,
+	// including an uncertain soft delete, before forgetting the lease.
+	if spObjectID != "" {
+		spErr := c.deleteServicePrincipal(b.reconciliationContext(ctx, issuedAt, spObjectID), spObjectID, permanentlyDelete)
+		var pending *api.PurgePendingError
+		if errors.As(spErr, &pending) {
+			if err := b.deferPurge(ctx, req.Storage, spErr); err != nil {
+				return resp, err
+			}
+		} else if spErr != nil {
+			resp.AddWarning(spErr.Error())
+			if _, walErr := framework.PutWAL(ctx, req.Storage, walServicePrincipal, &walSP{
+				ObjectID: spObjectID, PermanentlyDelete: permanentlyDelete,
+				IssuedAt: issuedAt, Expiration: time.Now().Add(maxWALAge),
+			}); walErr != nil {
+				return resp, errors.Join(spErr, fmt.Errorf("error recording service principal cleanup: %w", walErr))
+			}
+		}
 	}
 
-	err = c.deleteApp(ctx, appObjectID, permanentlyDelete)
-	return resp, err
+	return resp, nil
+}
+
+func leaseIssuedAt(secret *logical.Secret) (time.Time, error) {
+	if raw, ok := secret.InternalData["issued_at"]; ok {
+		value, ok := raw.(string)
+		if !ok {
+			return time.Time{}, errors.New("internal data 'issued_at' is not a timestamp string")
+		}
+		issuedAt, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil || issuedAt.IsZero() {
+			return time.Time{}, fmt.Errorf("invalid internal data 'issued_at': %q", value)
+		}
+		return issuedAt, nil
+	}
+	return secret.IssueTime, nil
+}
+
+func (b *azureSecretBackend) reconciliationContext(ctx context.Context, issuedAt time.Time, objectID string) context.Context {
+	return api.WithCleanupReconciliation(ctx, issuedAt, func() {
+		b.Logger().Warn("cleanup accepted repeated active 404s using lease-age heuristic",
+			"objectID", objectID, "issued_at", issuedAt, "legacy_unknown_age", issuedAt.IsZero())
+	})
 }
 
 func (b *azureSecretBackend) staticSPRevoke(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {

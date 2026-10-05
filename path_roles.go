@@ -587,7 +587,7 @@ func (b *azureSecretBackend) pathRoleDelete(ctx context.Context, req *logical.Re
 			resp.AddWarning(err.Error())
 		}
 
-		if err = c.deleteApp(ctx, role.ApplicationObjectID, role.PermanentlyDelete); err != nil {
+		if err = b.deferPurge(ctx, req.Storage, c.deleteApp(ctx, role.ApplicationObjectID, role.PermanentlyDelete)); err != nil {
 			return nil, fmt.Errorf("error deleting persisted app: %w", err)
 		}
 	}

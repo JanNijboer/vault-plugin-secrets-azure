@@ -12,6 +12,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
 	"github.com/hashicorp/go-cleanhttp"
@@ -227,8 +228,16 @@ func (p *provider) CreateServicePrincipal(ctx context.Context, appID string, sta
 	return p.spClient.CreateServicePrincipal(ctx, appID, startDate, endDate)
 }
 
+func (p *provider) PurgeDeletedObject(ctx context.Context, objectID string) error {
+	return p.appClient.PurgeDeletedObject(ctx, objectID)
+}
+
 func (p *provider) DeleteServicePrincipal(ctx context.Context, spObjectID string, permanentlyDelete bool) error {
 	return p.spClient.DeleteServicePrincipal(ctx, spObjectID, permanentlyDelete)
+}
+
+func (p *provider) FindServicePrincipalsForCleanup(ctx context.Context, appID string) ([]api.ServicePrincipal, error) {
+	return p.spClient.FindServicePrincipalsForCleanup(ctx, appID)
 }
 
 // ListRoles like all Azure roles with a scope (often subscription).
@@ -262,6 +271,7 @@ func (p *provider) GetRoleAssignmentByID(ctx context.Context, roleAssignmentID s
 
 // DeleteRoleAssignmentByID deletes a role assignment.
 func (p *provider) DeleteRoleAssignmentByID(ctx context.Context, roleAssignmentID string) (armauthorization.RoleAssignmentsClientDeleteByIDResponse, error) {
+	ctx = runtime.WithRetryOptions(ctx, policy.RetryOptions{MaxRetries: -1})
 	return p.raClient.DeleteByID(ctx, roleAssignmentID, nil)
 }
 
